@@ -2135,6 +2135,25 @@ public class HelixClusterManager implements ClusterMap {
     private List<ReplicaId> createNewInstance(DataNodeConfig dataNodeConfig, String dcName) throws Exception {
       String instanceName = dataNodeConfig.getInstanceName();
       logger.info("Adding node {} and its disks and replicas in {}", instanceName, dcName);
+
+      // Pre-validate for duplicate partitions before touching any shared state.
+      // A duplicate partition (same partition on two disks of the same node) indicates a corrupt DataNodeConfig.
+      // Failing self is fatal; for any other node we skip it so the rest of the cluster can still initialize.
+      try {
+        validateNoIntraNodeDuplicates(dataNodeConfig);
+      } catch (IllegalStateException e) {
+        if (instanceName.equals(selfInstanceName)) {
+          throw new IOException(
+              "Fatal: duplicate partition in DataNodeConfig for self instance " + instanceName + ": " + e.getMessage(),
+              e);
+        }
+        logger.error(
+            "Skipping node {} in {} due to duplicate partition in DataNodeConfig (other cluster nodes unaffected): {}",
+            instanceName, dcName, e.getMessage());
+        dataNodeInitializationFailureCount.incrementAndGet();
+        return Collections.emptyList();
+      }
+
       AmbryDataNode datanode = null;
       try {
         datanode =
@@ -2151,11 +2170,66 @@ public class HelixClusterManager implements ClusterMap {
       if (!instanceName.equals(selfInstanceName)) {
         datanode.setState(HardwareState.UNAVAILABLE);
       }
-      List<ReplicaId> addedReplicas = initializeDisksAndReplicasOnNode(datanode, dataNodeConfig);
-      instanceNameToAmbryDataNode.put(instanceName, datanode);
-      dcToNodes.computeIfAbsent(datanode.getDatacenterName(), s -> ConcurrentHashMap.newKeySet()).add(datanode);
-      allInstances.add(instanceName);
-      return addedReplicas;
+      // Initialize disks and replicas. For non-duplicate errors (e.g. inconsistent replica capacity across nodes),
+      // fail self or skip and clean up partial state for other nodes.
+      try {
+        List<ReplicaId> addedReplicas = initializeDisksAndReplicasOnNode(datanode, dataNodeConfig);
+        instanceNameToAmbryDataNode.put(instanceName, datanode);
+        dcToNodes.computeIfAbsent(datanode.getDatacenterName(), s -> ConcurrentHashMap.newKeySet()).add(datanode);
+        allInstances.add(instanceName);
+        return addedReplicas;
+      } catch (Exception e) {
+        if (instanceName.equals(selfInstanceName)) {
+          throw new IOException(
+              "Fatal: error initializing disks and replicas for self instance " + instanceName + ": " + e.getMessage(),
+              e);
+        }
+        logger.error(
+            "Failed to initialize disks and replicas for node {} in {}, skipping and cleaning up partial state.",
+            instanceName, dcName, e);
+        cleanUpPartialDataNode(datanode);
+        dataNodeInitializationFailureCount.incrementAndGet();
+        return Collections.emptyList();
+      }
+    }
+
+    /**
+     * Pre-validate that no partition appears on more than one disk for this node. This is called before any shared
+     * state is modified, so no cleanup is needed on failure.
+     * @param dataNodeConfig the {@link DataNodeConfig} to validate.
+     * @throws IllegalStateException if the same partition ID appears on two or more disks.
+     */
+    private void validateNoIntraNodeDuplicates(DataNodeConfig dataNodeConfig) {
+      Set<String> seenPartitions = new HashSet<>();
+      for (Map.Entry<String, DataNodeConfig.DiskConfig> diskEntry : dataNodeConfig.getDiskConfigs().entrySet()) {
+        for (String partitionName : diskEntry.getValue().getReplicaConfigs().keySet()) {
+          if (!seenPartitions.add(partitionName)) {
+            throw new IllegalStateException(
+                "Partition " + partitionName + " appears on multiple disks for instance "
+                    + dataNodeConfig.getInstanceName());
+          }
+        }
+      }
+    }
+
+    /**
+     * Clean up any partially-added state for a datanode that failed initialization. Removes orphaned replicas from
+     * partition replica sets, removes disk/replica maps for the datanode, and corrects capacity counters.
+     * @param datanode the {@link AmbryDataNode} that failed to initialize.
+     */
+    private void cleanUpPartialDataNode(AmbryDataNode datanode) {
+      Map<String, AmbryReplica> replicaMap = ambryDataNodeToAmbryReplicas.remove(datanode);
+      if (replicaMap != null) {
+        for (AmbryReplica replica : replicaMap.values()) {
+          removeReplicasFromPartition(replica.getPartitionId(), Collections.singletonList(replica));
+        }
+      }
+      Set<AmbryDisk> disks = ambryDataNodeToAmbryDisks.remove(datanode);
+      if (disks != null) {
+        for (AmbryDisk disk : disks) {
+          clusterWideRawCapacityBytes.getAndAdd(-1 * disk.getRawCapacityInBytes());
+        }
+      }
     }
 
     /**

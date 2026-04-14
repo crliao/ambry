@@ -391,14 +391,208 @@ public class HelixClusterManagerTest {
     props.setProperty("clustermap.dcs.zk.connect.strings", zkJson.toString(2));
     props.setProperty("clustermap.current.xid", Long.toString(CURRENT_XID));
     ClusterMapConfig clusterMapConfig = new ClusterMapConfig(new VerifiableProperties(props));
-    // instantiate HelixClusterManager and its initialization should fail because validation on replica capacity cannot
-    // succeed (The aforementioned replica has larger capacity than its peers)
+    // The node with inconsistent replica capacity is not self, so it should be skipped and initialization succeeds.
+    metricRegistry = new MetricRegistry();
+    HelixClusterManager helixClusterManager =
+        new HelixClusterManager(clusterMapConfig, selfInstanceName,
+            new MockHelixManagerFactory(testCluster, null, null, useAggregatedView), metricRegistry);
+
+    // The bad node should be absent from the cluster map
+    assertNull("Node with inconsistent replica capacity should not be in cluster map",
+        helixClusterManager.getDataNodeId(newAddedNode.getHostname(), newAddedNode.getPort()));
+
+    // Other nodes are still present and functional
+    assertTrue("Other nodes should still be in cluster map", helixClusterManager.getDataNodeIds().size() > 0);
+
+    // No orphan replicas: every replica must belong to a registered node
+    for (PartitionId partition : helixClusterManager.getAllPartitionIds(null)) {
+      for (ReplicaId replica : partition.getReplicaIds()) {
+        assertNotNull("Replica's node should be registered in cluster map",
+            helixClusterManager.getDataNodeId(replica.getDataNodeId().getHostname(),
+                replica.getDataNodeId().getPort()));
+      }
+    }
+    helixClusterManager.close();
+  }
+
+  /**
+   * Test that a node with a duplicate partition (same partition on two different disks) is skipped during
+   * HelixClusterManager initialization, leaving the rest of the cluster functional.
+   */
+  @Test
+  public void duplicatePartitionOnSameNodeSkipsNodeTest() throws Exception {
+    assumeTrue(listenCrossColo && !fullAutoCompatible);
+    clusterManager.close();
+    metricRegistry = new MetricRegistry();
+    String staticClusterName = "TestOnly";
+    File tempDir = Files.createTempDirectory("helixClusterManagerTest").toFile();
+    tempDir.deleteOnExit();
+    String tempDirPath = tempDir.getAbsolutePath();
+    String testHardwareLayoutPath = tempDirPath + File.separator + "hardwareLayoutTest.json";
+    String testPartitionLayoutPath = tempDirPath + File.separator + "partitionLayoutTest.json";
+    String testZkLayoutPath = tempDirPath + File.separator + "zkLayoutPath.json";
+
+    TestHardwareLayout testHardwareLayout =
+        constructInitialHardwareLayoutJSON(staticClusterName);
+    TestPartitionLayout testPartitionLayout =
+        constructInitialPartitionLayoutJSON(testHardwareLayout, 3, localDc);
+    JSONObject zkJson = constructZkLayoutJSON(dcsToZkInfo.values());
+    Utils.writeJsonObjectToFile(zkJson, testZkLayoutPath);
+    Utils.writeJsonObjectToFile(testHardwareLayout.getHardwareLayout().toJSONObject(), testHardwareLayoutPath);
+    Utils.writeJsonObjectToFile(testPartitionLayout.getPartitionLayout().toJSONObject(), testPartitionLayoutPath);
+    MockHelixCluster testCluster =
+        new MockHelixCluster("AmbryTest-", testHardwareLayoutPath, testPartitionLayoutPath, testZkLayoutPath, localDc,
+            useAggregatedView, 100, fullAutoCompatible ? 10000 : -1);
+
+    // Inject a duplicate partition onto two disks of a non-self node's InstanceConfig
+    MockHelixAdmin localAdmin = testCluster.getHelixAdminFromDc(localDc);
+    List<InstanceConfig> instanceConfigs = localAdmin.getInstanceConfigs("AmbryTest-" + staticClusterName);
+    InstanceConfig targetConfig =
+        instanceConfigs.stream().filter(c -> !c.getInstanceName().equals(selfInstanceName)).findFirst().get();
+    String targetInstanceName = targetConfig.getInstanceName();
+
+    Map<String, Map<String, String>> mapFields = targetConfig.getRecord().getMapFields();
+    List<String> diskMountPaths = new ArrayList<>();
+    String duplicateReplicaEntry = null;
+    for (Map.Entry<String, Map<String, String>> entry : mapFields.entrySet()) {
+      if (entry.getValue().containsKey(ClusterMapUtils.DISK_STATE)) {
+        diskMountPaths.add(entry.getKey());
+        if (duplicateReplicaEntry == null) {
+          String replicasStr = entry.getValue().get(ClusterMapUtils.REPLICAS_STR);
+          if (replicasStr != null && !replicasStr.isEmpty()) {
+            duplicateReplicaEntry = replicasStr.split(ClusterMapUtils.REPLICAS_DELIM_STR)[0];
+          }
+        }
+      }
+    }
+    assertTrue("Node should have at least 2 disks", diskMountPaths.size() >= 2);
+    assertNotNull("Node should have at least one replica to duplicate", duplicateReplicaEntry);
+
+    // Add the same replica entry to the second disk, creating the duplicate
+    String secondDisk = diskMountPaths.get(1);
+    Map<String, String> secondDiskProps = mapFields.get(secondDisk);
+    String existingReplicas = secondDiskProps.getOrDefault(ClusterMapUtils.REPLICAS_STR, "");
+    secondDiskProps.put(ClusterMapUtils.REPLICAS_STR,
+        existingReplicas + duplicateReplicaEntry + ClusterMapUtils.REPLICAS_DELIM_STR);
+    localAdmin.setInstanceConfig("AmbryTest-" + staticClusterName, targetInstanceName, targetConfig);
+
+    Properties props = new Properties();
+    props.setProperty("clustermap.host.name", hostname);
+    props.setProperty("clustermap.cluster.name", "AmbryTest-" + staticClusterName);
+    props.setProperty("clustermap.aggregated.view.cluster.name", "AmbryTest-" + staticClusterName);
+    props.setProperty("clustermap.use.aggregated.view", Boolean.toString(useAggregatedView));
+    props.setProperty("clustermap.datacenter.name", localDc);
+    props.setProperty("clustermap.port", Integer.toString(portNum));
+    props.setProperty("clustermap.dcs.zk.connect.strings", zkJson.toString(2));
+    props.setProperty("clustermap.current.xid", Long.toString(CURRENT_XID));
+    ClusterMapConfig clusterMapConfig = new ClusterMapConfig(new VerifiableProperties(props));
+
+    // Initialization should succeed: the bad node is not self, so it is skipped
+    HelixClusterManager helixClusterManager =
+        new HelixClusterManager(clusterMapConfig, selfInstanceName,
+            new MockHelixManagerFactory(testCluster, null, null, useAggregatedView), metricRegistry);
+
+    // The node with the duplicate partition should not be in the cluster map
+    DataNodeId badNode = helixClusterManager.getDataNodeId(targetConfig.getHostName(),
+        Integer.parseInt(targetConfig.getPort()));
+    assertNull("Node with duplicate partition should not be in cluster map", badNode);
+
+    // Other nodes are still present and functional
+    assertTrue("Other nodes should still be in cluster map", helixClusterManager.getDataNodeIds().size() > 0);
+
+    // No orphan replicas: every replica must belong to a registered node
+    for (PartitionId partition : helixClusterManager.getAllPartitionIds(null)) {
+      for (ReplicaId replica : partition.getReplicaIds()) {
+        assertNotNull("Replica's node should be registered in cluster map",
+            helixClusterManager.getDataNodeId(replica.getDataNodeId().getHostname(),
+                replica.getDataNodeId().getPort()));
+      }
+    }
+    helixClusterManager.close();
+  }
+
+  /**
+   * Test that when self has a duplicate partition in its DataNodeConfig, HelixClusterManager fails to initialize
+   * (rather than silently skipping self).
+   */
+  @Test
+  public void selfNodeWithDuplicatePartitionFailsInitTest() throws Exception {
+    assumeTrue(listenCrossColo && !fullAutoCompatible);
+    clusterManager.close();
+    metricRegistry = new MetricRegistry();
+    String staticClusterName = "TestOnly";
+    File tempDir = Files.createTempDirectory("helixClusterManagerTest").toFile();
+    tempDir.deleteOnExit();
+    String tempDirPath = tempDir.getAbsolutePath();
+    String testHardwareLayoutPath = tempDirPath + File.separator + "hardwareLayoutTest.json";
+    String testPartitionLayoutPath = tempDirPath + File.separator + "partitionLayoutTest.json";
+    String testZkLayoutPath = tempDirPath + File.separator + "zkLayoutPath.json";
+
+    TestHardwareLayout testHardwareLayout =
+        constructInitialHardwareLayoutJSON(staticClusterName);
+    TestPartitionLayout testPartitionLayout =
+        constructInitialPartitionLayoutJSON(testHardwareLayout, 3, localDc);
+    JSONObject zkJson = constructZkLayoutJSON(dcsToZkInfo.values());
+    Utils.writeJsonObjectToFile(zkJson, testZkLayoutPath);
+    Utils.writeJsonObjectToFile(testHardwareLayout.getHardwareLayout().toJSONObject(), testHardwareLayoutPath);
+    Utils.writeJsonObjectToFile(testPartitionLayout.getPartitionLayout().toJSONObject(), testPartitionLayoutPath);
+    MockHelixCluster testCluster =
+        new MockHelixCluster("AmbryTest-", testHardwareLayoutPath, testPartitionLayoutPath, testZkLayoutPath, localDc,
+            useAggregatedView, 100, fullAutoCompatible ? 10000 : -1);
+
+    // Inject a duplicate partition onto the self node's InstanceConfig
+    MockHelixAdmin localAdmin = testCluster.getHelixAdminFromDc(localDc);
+    InstanceConfig selfConfig = localAdmin.getInstanceConfigs("AmbryTest-" + staticClusterName)
+        .stream()
+        .filter(c -> c.getInstanceName().equals(selfInstanceName))
+        .findFirst()
+        .orElseThrow(() -> new IllegalStateException("Self instance not found in cluster"));
+
+    Map<String, Map<String, String>> mapFields = selfConfig.getRecord().getMapFields();
+    List<String> diskMountPaths = new ArrayList<>();
+    String duplicateReplicaEntry = null;
+    for (Map.Entry<String, Map<String, String>> entry : mapFields.entrySet()) {
+      if (entry.getValue().containsKey(ClusterMapUtils.DISK_STATE)) {
+        diskMountPaths.add(entry.getKey());
+        if (duplicateReplicaEntry == null) {
+          String replicasStr = entry.getValue().get(ClusterMapUtils.REPLICAS_STR);
+          if (replicasStr != null && !replicasStr.isEmpty()) {
+            duplicateReplicaEntry = replicasStr.split(ClusterMapUtils.REPLICAS_DELIM_STR)[0];
+          }
+        }
+      }
+    }
+    assertTrue("Self node should have at least 2 disks", diskMountPaths.size() >= 2);
+    assertNotNull("Self node should have at least one replica to duplicate", duplicateReplicaEntry);
+
+    String secondDisk = diskMountPaths.get(1);
+    Map<String, String> secondDiskProps = mapFields.get(secondDisk);
+    String existingReplicas = secondDiskProps.getOrDefault(ClusterMapUtils.REPLICAS_STR, "");
+    secondDiskProps.put(ClusterMapUtils.REPLICAS_STR,
+        existingReplicas + duplicateReplicaEntry + ClusterMapUtils.REPLICAS_DELIM_STR);
+    localAdmin.setInstanceConfig("AmbryTest-" + staticClusterName, selfInstanceName, selfConfig);
+
+    Properties props = new Properties();
+    props.setProperty("clustermap.host.name", hostname);
+    props.setProperty("clustermap.cluster.name", "AmbryTest-" + staticClusterName);
+    props.setProperty("clustermap.aggregated.view.cluster.name", "AmbryTest-" + staticClusterName);
+    props.setProperty("clustermap.use.aggregated.view", Boolean.toString(useAggregatedView));
+    props.setProperty("clustermap.datacenter.name", localDc);
+    props.setProperty("clustermap.port", Integer.toString(portNum));
+    props.setProperty("clustermap.dcs.zk.connect.strings", zkJson.toString(2));
+    props.setProperty("clustermap.current.xid", Long.toString(CURRENT_XID));
+    ClusterMapConfig clusterMapConfig = new ClusterMapConfig(new VerifiableProperties(props));
+
+    // Initialization must fail because self has a duplicate partition — the server should not start
     try {
       new HelixClusterManager(clusterMapConfig, selfInstanceName,
           new MockHelixManagerFactory(testCluster, null, null, useAggregatedView), metricRegistry);
-      fail("Initialization should fail due to inconsistent replica capacity");
+      fail("Initialization should fail when self DataNodeConfig has a duplicate partition");
     } catch (IOException e) {
-      // expected
+      assertTrue("Exception should mention duplicate partition",
+          e.getMessage().contains("duplicate partition") || e.getCause() != null && e.getCause()
+              .getMessage()
+              .contains("appears on multiple disks"));
     }
   }
 
