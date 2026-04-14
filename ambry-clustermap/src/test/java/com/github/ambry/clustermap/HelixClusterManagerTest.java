@@ -421,7 +421,9 @@ public class HelixClusterManagerTest {
    */
   @Test
   public void duplicatePartitionOnSameNodeSkipsNodeTest() throws Exception {
-    assumeTrue(listenCrossColo && !fullAutoCompatible);
+    // Aggregated view reads DataNodeConfigs from ZK; the mock injection (setInstanceConfig) only updates the
+    // in-memory admin, so this test is limited to non-aggregated mode.
+    assumeTrue(listenCrossColo && !fullAutoCompatible && !useAggregatedView);
     clusterManager.close();
     metricRegistry = new MetricRegistry();
     String staticClusterName = "TestOnly";
@@ -517,7 +519,9 @@ public class HelixClusterManagerTest {
    */
   @Test
   public void selfNodeWithDuplicatePartitionFailsInitTest() throws Exception {
-    assumeTrue(listenCrossColo && !fullAutoCompatible);
+    // Aggregated view reads DataNodeConfigs from ZK; the mock injection (setInstanceConfig) only updates the
+    // in-memory admin, so this test is limited to non-aggregated mode.
+    assumeTrue(listenCrossColo && !fullAutoCompatible && !useAggregatedView);
     clusterManager.close();
     metricRegistry = new MetricRegistry();
     String staticClusterName = "TestOnly";
